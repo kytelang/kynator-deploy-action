@@ -1,0 +1,57 @@
+# Example: a Kyte app repo deploying to its Kynator orchestrator on every v* tag.
+# Copy into your app repo as `.github/workflows/deploy.yml`.
+#
+# Set a repo Variable ORCH_URL (artifactd base URL) and a repo Secret ORCH_TOKEN (deploy token).
+
+name: Deploy
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label (defaults to the ref name)"
+        required: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Make `kyte` available on PATH. Until a prebuilt toolchain is published, build it from source.
+      # (Replace this whole block with a `setup-kyte` download step when one exists.)
+      - uses: actions/checkout@v4
+        with:
+          repository: kytelang/kyte
+          path: .kyte-toolchain
+          token: ${{ secrets.KYTE_TOKEN || github.token }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Install LLVM 21
+        run: |
+          sudo apt-get update
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y llvm-21-dev libclang-21-dev clang-21 zlib1g-dev libzstd-dev libxml2-dev liblzma-dev
+          sudo ln -sf "$(command -v clang++-21)" /usr/local/bin/clang++
+          echo "KYTE_LLVM_PREFIX=/usr/lib/llvm-21" >> "$GITHUB_ENV"
+      - name: Build the Kyte toolchain
+        working-directory: .kyte-toolchain
+        run: zig build -Doptimize=ReleaseFast
+      - name: Put kyte on PATH
+        run: echo "$HOME/.kyte/bin" >> "$GITHUB_PATH"
+
+      # Build the app and deploy it to the orchestrator. `spec-template` points at your committed
+      # manifest (deploy/workload.yaml) -- the single source of truth that both runs AND configures the
+      # app. The action substitutes the built binary's digest for the sha256:__ARTIFACT__ placeholder.
+      - uses: kytelang/kynator-deploy-action@v1
+        with:
+          orch-url:      ${{ vars.ORCH_URL }}
+          token:         ${{ secrets.ORCH_TOKEN }}
+          app:           webapp
+          app-src:       src/main.ky
+          target:        linux-x86_64
+          version:       ${{ github.event.inputs.version || github.ref_name }}
+          spec-template: deploy/workload.yaml

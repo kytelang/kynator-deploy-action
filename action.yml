@@ -1,0 +1,183 @@
+name: "Deploy Kyte app to the Kynator orchestrator"
+description: >
+  Build a Kyte web app and deploy it to a server running the Kynator orchestrator. Uploads the binary as a
+  content-addressed blob to artifactd, binds it to app/version in the registry, and writes the workload
+  manifest (referencing the binary by hash) into the config store. kynatord then pulls the binary and
+  reconciles the replicas. No SSH, no container registry, no database in the loop.
+author: "Kyte"
+
+branding:
+  icon: "upload-cloud"
+  color: "purple"
+
+inputs:
+  orch-url:
+    description: "artifactd base URL of the orchestrator, e.g. https://orch.example.com:8135 (use https in production)"
+    required: true
+  token:
+    description: "Deploy bearer token artifactd guards its routes with. Pass a repository SECRET, never a literal."
+    required: true
+  app:
+    description: "Workload name: the workloads/<app> config key and the apps/<app> registry namespace"
+    required: true
+  version:
+    description: "Version label to bind in the registry (immutable; bump it per release). Defaults to the git ref name."
+    required: false
+    default: ""
+  app-src:
+    description: "Path to the app's entry .ky file. Required unless `binary` is supplied (a prebuilt binary)."
+    required: false
+    default: ""
+  binary:
+    description: "Path to an already-built binary. When set, the build step is skipped and this is deployed as-is."
+    required: false
+    default: ""
+  target:
+    description: "Build target triple for the SERVER's OS/arch when building from app-src"
+    required: false
+    default: "linux-x86_64"
+  kyte:
+    description: "Path to the `kyte` compiler. Defaults to `kyte` on PATH (provide it in a prior step)."
+    required: false
+    default: "kyte"
+  replicas:
+    description: "Desired replica count (used when generating a manifest)"
+    required: false
+    default: "2"
+  port:
+    description: "Public listen port for the replicas (basePort; replica i uses basePort+i)"
+    required: false
+    default: "8080"
+  args:
+    description: "Extra argv for each replica, space-separated (the port flag is injected by kynatord)"
+    required: false
+    default: ""
+  spec-template:
+    description: >
+      Optional path to a JSON workload spec containing the literal "sha256:__ARTIFACT__", replaced with
+      the real digest. When empty, a minimal valid manifest is generated from the inputs.
+    required: false
+    default: ""
+
+outputs:
+  sha:
+    description: "The sha256 hex digest of the deployed binary"
+    value: ${{ steps.deploy.outputs.sha }}
+  revision:
+    description: "The config-store revision at which workloads/<app> was written"
+    value: ${{ steps.deploy.outputs.revision }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: deploy
+      shell: bash
+      env:
+        ORCH_URL: ${{ inputs.orch-url }}
+        ORCH_TOKEN: ${{ inputs.token }}
+        APP: ${{ inputs.app }}
+        VERSION: ${{ inputs.version || github.ref_name }}
+        APP_SRC: ${{ inputs.app-src }}
+        BINARY_IN: ${{ inputs.binary }}
+        TARGET: ${{ inputs.target }}
+        KYTE: ${{ inputs.kyte }}
+        REPLICAS: ${{ inputs.replicas }}
+        PORT: ${{ inputs.port }}
+        EXTRA_ARGS: ${{ inputs.args }}
+        SPEC_TEMPLATE: ${{ inputs.spec-template }}
+        ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+        : "${ORCH_URL:?orch-url is required}"
+        : "${ORCH_TOKEN:?token is required}"
+        : "${APP:?app is required}"
+
+        # --- 1. get the binary: build from source, or take a prebuilt one --------------------------
+        if [ -n "$BINARY_IN" ]; then
+          BIN="$BINARY_IN"
+          test -f "$BIN" || { echo "::error::binary not found: $BIN"; exit 1; }
+          echo "using prebuilt binary $BIN"
+        else
+          test -n "$APP_SRC" || { echo "::error::provide either app-src (to build) or binary (prebuilt)"; exit 1; }
+          test -f "$APP_SRC" || { echo "::error::app-src not found: $APP_SRC"; exit 1; }
+          command -v "$KYTE" >/dev/null 2>&1 || { echo "::error::kyte compiler not found on PATH ('$KYTE'); add a setup step before this action"; exit 1; }
+          BIN="${RUNNER_TEMP:-/tmp}/$APP"
+          echo "building $APP_SRC -> $BIN (target $TARGET)"
+          "$KYTE" "$APP_SRC" -o "$BIN" --target "$TARGET"
+        fi
+
+        BASE="${ORCH_URL%/}"                       # strip any trailing slash
+        AUTH="Authorization: Bearer $ORCH_TOKEN"
+        # curl helper: $1 = URL, $2 = out file, rest = extra curl args. Token stays in a header, never logged.
+        req() { curl -sS -o "$2" -w '%{http_code}' -H "$AUTH" "${@:3}" "$1"; }
+
+        # --- 2. content-address the binary ---------------------------------------------------------
+        SHA="$(sha256sum "$BIN" | cut -d' ' -f1)"
+        echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+        echo "artifact sha256:$SHA ($(wc -c < "$BIN" | tr -d ' ') bytes)"
+
+        # --- 3. upload the blob (skipped when artifactd already has it) ----------------------------
+        code="$(req "$BASE/artifacts/$SHA/exists" /tmp/ndbody)"
+        if [ "$code" = "200" ]; then
+          echo "blob already present, skipping upload"
+        elif [ "$code" = "404" ]; then
+          code="$(req "$BASE/artifacts/$SHA" /tmp/ndbody -X PUT --data-binary @"$BIN")"
+          case "$code" in
+            201|200) echo "blob uploaded ($code)";;
+            413) echo "::error::artifact exceeds artifactd's size limit"; exit 1;;
+            409) echo "::error::artifactd rejected the blob: content does not match its hash"; exit 1;;
+            401) echo "::error::deploy token rejected (401) on upload"; exit 1;;
+            *)   echo "::error::unexpected $code uploading blob"; cat /tmp/ndbody; exit 1;;
+          esac
+        else
+          echo "::error::unexpected $code from the exists check (is orch-url/token correct and reachable?)"; exit 1
+        fi
+
+        # --- 4. bind app/version -> digest in the registry (immutable, idempotent) -----------------
+        code="$(req "$BASE/apps/$APP/$VERSION" /tmp/ndbody -X PUT --data-binary "sha256:$SHA")"
+        case "$code" in
+          201|200) echo "bound $APP/$VERSION -> sha256:$SHA ($code)";;
+          409) echo "::error::$APP/$VERSION already bound to a DIFFERENT digest (versions are immutable); bump the version"; exit 1;;
+          404) echo "::error::registry says the blob is missing (upload did not land)"; exit 1;;
+          *)   echo "::error::unexpected $code binding the version"; cat /tmp/ndbody; exit 1;;
+        esac
+
+        # --- 5. render the workload manifest (references the binary BY HASH) ------------------------
+        if [ -n "$SPEC_TEMPLATE" ]; then
+          test -f "$SPEC_TEMPLATE" || { echo "::error::spec-template not found: $SPEC_TEMPLATE"; exit 1; }
+          sed "s|sha256:__ARTIFACT__|sha256:$SHA|g" "$SPEC_TEMPLATE" > /tmp/ndspec.json
+          echo "using spec template $SPEC_TEMPLATE"
+        else
+          ARGS_JSON="[]"
+          if [ -n "$EXTRA_ARGS" ]; then
+            ARGS_JSON="[$(printf '%s' "$EXTRA_ARGS" | tr ' ' '\n' | grep -v '^$' | sed 's/"/\\"/g;s/.*/"&"/' | paste -sd, -)]"
+          fi
+          cat > /tmp/ndspec.json <<JSON
+        {
+          "name": "$APP",
+          "artifact": "sha256:$SHA",
+          "args": $ARGS_JSON,
+          "restartPolicy": "always",
+          "replicas": $REPLICAS,
+          "service": { "basePort": $PORT, "portFlag": "--port" },
+          "probe": { "path": "/healthz", "periodMs": 2000 }
+        }
+        JSON
+        fi
+        echo "--- workload manifest ---"; cat /tmp/ndspec.json
+
+        # --- 6. publish desired state into the config store: workloads/<app> -----------------------
+        code="$(req "$BASE/cfg/put" /tmp/ndbody -X POST -H "x-cfg-key: workloads/$APP" -H "x-cfg-by: ci:$ACTOR" --data-binary @/tmp/ndspec.json)"
+        if [ "$code" != "200" ]; then echo "::error::config-store put returned $code"; cat /tmp/ndbody; exit 1; fi
+        REV="$(cat /tmp/ndbody)"
+        echo "revision=$REV" >> "$GITHUB_OUTPUT"
+        echo "workloads/$APP written at store revision $REV"
+
+        # --- 7. read back and verify -------------------------------------------------------------
+        code="$(req "$BASE/cfg/get" /tmp/ndbody -H "x-cfg-key: workloads/$APP")"
+        if [ "$code" = "200" ] && grep -q "sha256:$SHA" /tmp/ndbody; then
+          echo "verified: workloads/$APP references sha256:$SHA"
+        else
+          echo "::error::read-back verification failed (code $code)"; exit 1
+        fi
+        echo "Deployed $APP $VERSION. kynatord will pull sha256:$SHA and reconcile $REPLICAS replica(s)."
